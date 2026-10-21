@@ -11,6 +11,7 @@
 # Build:   npm run tools:build           (== bash tools/build.sh)
 # Verify:  npm run tools:check           (== scripts/check-tools-image.sh)
 # Heavy (~minutes, multi-GB). Built on demand, not in CI.
+FROM node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS patched-node
 FROM kalilinux/kali-rolling
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -59,9 +60,13 @@ RUN go install github.com/projectdiscovery/httpx/cmd/httpx@latest        && \
     rm -rf /root/go/pkg /root/.cache/go-build
 
 # ── npm + foundry: smart-contract "+" (solhint, forge/cast) ──
-RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm && \
+COPY --from=patched-node /usr/local/bin/node /usr/local/bin/node
+COPY --from=patched-node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    node -e "if (process.version !== 'v24.22.1') process.exit(1)" && \
     npm install -g solhint && \
-    rm -rf /var/lib/apt/lists/* /root/.npm
+    rm -rf /root/.npm
 RUN curl -L https://foundry.paradigm.xyz | bash && /root/.foundry/bin/foundryup || \
     echo "foundry install skipped (offline build) — re-run foundryup later"
 
