@@ -193,6 +193,40 @@ function describeToolAction(toolName: string, context: ToolContext): string {
   return `${toolName}${summary ? ` (${summary})` : ''}${target ? ` → ${target}` : ''}`;
 }
 
+// Only Arsenal supplies this per-call policy. Model parameters cannot override it.
+const EXECUTION_SCOPE = Symbol('arsenalExecutionScope');
+type ScopedToolContext = ToolContext & { [EXECUTION_SCOPE]?: ArsenalScope | null };
+
+/** Follow only safe-method redirects, checking mission scope before every request. */
+async function fetchWithinScope(context: ToolContext, input: string, init: RequestInit): Promise<Response> {
+  const scope = (context as ScopedToolContext)[EXECUTION_SCOPE] ?? null;
+  let url = new URL(input);
+  const method = (init.method ?? 'GET').toUpperCase();
+  const headers = new Headers(init.headers);
+  const redirectStatuses = new Set([301, 302, 303, 307, 308]);
+  for (let hops = 0; ; hops++) {
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+      throw new Error('Redirect refused: invalid HTTP destination');
+    }
+    const blocked = scopeViolation(scope, { parameters: { url: url.href } });
+    if (blocked) throw new Error(`SCOPE DENIED: redirect destination '${blocked}'`);
+    const response = await fetch(url, { ...init, method, headers, redirect: 'manual' });
+    const location = response.headers.get('location');
+    if (!redirectStatuses.has(response.status) || location === null) return response;
+    await response.body?.cancel();
+    if (hops >= 5) throw new Error('Redirect refused: five-hop limit');
+    // Do not replay mutations or silently change POST to GET after server instructions.
+    if (method !== 'GET' && method !== 'HEAD') throw new Error('Redirect refused: unsafe method');
+    const next = new URL(location, url);
+    if (url.protocol === 'https:' && next.protocol === 'http:') throw new Error('Redirect refused: HTTPS downgrade');
+    // Preserve same-origin headers; do not forward caller credentials to another origin.
+    if (next.origin !== url.origin) {
+      for (const name of [...headers.keys()]) headers.delete(name);
+    }
+    url = next;
+  }
+}
+
 export class Arsenal extends EventEmitter<ArsenalEvents> {
   private tools: Map<string, CustomTool> = new Map();
   /** Authorized egress scope; null = enforcement off (set by the server/mission for live runs). */
@@ -301,7 +335,11 @@ export class Arsenal extends EventEmitter<ArsenalEvents> {
     const startTime = Date.now();
 
     try {
-      const result = await tool.handler(context);
+      const executionContext: ScopedToolContext = {
+        ...context,
+        [EXECUTION_SCOPE]: this.scope ? { ...this.scope, allowedHosts: [...this.scope.allowedHosts] } : null,
+      };
+      const result = await tool.handler(executionContext);
       const durationMs = Date.now() - startTime;
 
       execution.completedAt = Date.now();
@@ -752,7 +790,7 @@ export const BUILTIN_TOOLS: CustomTool[] = [
       const body = context.parameters.body as string | undefined;
 
       try {
-        const response = await fetch(url, {
+        const response = await fetchWithinScope(context, url, {
           method,
           headers,
           body: body && method !== 'GET' ? body : undefined,
@@ -787,7 +825,7 @@ export const BUILTIN_TOOLS: CustomTool[] = [
         'Permissions-Policy', 'Cross-Origin-Opener-Policy', 'Cross-Origin-Resource-Policy',
       ];
       try {
-        const response = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(10000) });
+        const response = await fetchWithinScope(context, url, { method: 'HEAD', signal: AbortSignal.timeout(10000) });
         const analysis = securityHeaders.map(h => {
           const value = response.headers.get(h);
           return `${h}: ${value ? `✓ ${value}` : '✗ Missing'}`;
